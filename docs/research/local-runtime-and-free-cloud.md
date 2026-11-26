@@ -50,6 +50,10 @@ Two upstream facts constrain everything below:
 
 ### 1.1 Ollama
 
+> **Update 2026-11-26:** the team pin is now **v0.40.18** (2026-11-24); see
+> `docs/setup/hardware.md` for install commands and measured rows. The version
+> column above is left as written on 2026-11-17.
+
 * GPU support statement: "Ollama supports Nvidia GPUs with compute capability 5.0+ and driver version 550 and newer.
   Nvidia GPUs with compute capability 5.0 through 6.2 require driver version 570 or newer."
   <https://docs.ollama.com/gpu> — i.e. the GTX 1060 still works, but **only** with a ≥570 driver on both Linux and
