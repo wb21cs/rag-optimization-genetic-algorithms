@@ -24,6 +24,7 @@ import json
 import os
 import platform
 import re
+import secrets
 import shutil
 import statistics
 import subprocess
@@ -51,6 +52,8 @@ SEED = 42
 WARM_RUNS = 3
 SMALL_TOKENS = 512
 LARGE_TOKENS = 2048
+CHARS_PER_TOKEN = 6.0     # Qwen3 tokenizer measured at 5.3 on the filler text
+VRAM_TOLERANCE_MB = 256.0 # how far above idle a model unload may leave the card
 
 # ---------------------------------------------------------------- fixed prompt
 
@@ -71,12 +74,22 @@ PARAGRAPH = (
 QUESTION = "\n\nQuestion: Summarise the pipeline above in one short paragraph.\nAnswer:"
 
 
-def build_prompt(target_tokens):
-    """Deterministic, byte-identical on every machine. Token count is read
-    back from prompt_eval_count; the estimate is only for sizing."""
-    target_chars = target_tokens * 4
-    body = PARAGRAPH * max(1, target_chars // len(PARAGRAPH))
-    return body + QUESTION
+def build_prompt(target_tokens, nonce):
+    """Deterministic filler plus a per-run nonce.
+
+    The nonce is the point: Ollama caches prompt prefixes, so replaying the
+    same bytes makes every warm prefill a cache hit and reports absurd
+    throughput. A different first token invalidates the cache and forces the
+    full prompt to be evaluated.
+    """
+    target_chars = int(target_tokens * CHARS_PER_TOKEN)
+    repeats = max(1, -(-target_chars // len(PARAGRAPH)))
+    body = PARAGRAPH * repeats
+    return f"Run {nonce}. " + body + QUESTION
+
+
+def new_nonce():
+    return secrets.token_hex(4)
 
 
 # ---------------------------------------------------------------- HTTP helpers
@@ -265,17 +278,58 @@ def loaded_models():
         return []
 
 
-def unload(model):
+def vram_is_idle(idle_mb, tolerance=VRAM_TOLERANCE_MB):
+    used = gpu_mem_used_mb()
+    if used is None or idle_mb is None:
+        return True  # nothing to check against (no nvidia-smi)
+    return used <= idle_mb + tolerance
+
+
+def stop_model(model, timeout=90):
+    """Ask the server to unload one model and wait until /api/ps drops it."""
     try:
         post_json("/api/generate",
                   {"model": model, "prompt": "", "keep_alive": 0}, timeout=60)
     except (urllib.error.URLError, OSError):
         pass
-    for _ in range(60):
-        names = [m.get("name") or m.get("model") for m in loaded_models()]
-        if model not in names:
+
+    cli = shutil.which("ollama") or os.path.expanduser(
+        "~/.local/opt/ollama-0.40.18/bin/ollama")
+    if os.path.exists(cli):
+        try:
+            subprocess.run([cli, "stop", model], capture_output=True,
+                           text=True, timeout=60)
+        except (subprocess.SubprocessError, OSError):
+            pass
+
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if model not in loaded_names():
             return
         time.sleep(0.5)
+    raise RuntimeError(f"{model} did not unload (loaded: {loaded_names()})")
+
+
+def ensure_idle(idle_mb, timeout=120):
+    """Unload everything and prove the card is back at idle.
+
+    A model that is still resident silently contaminates the next model's
+    baseline and peak, so this aborts rather than reporting numbers nobody
+    can trust.
+    """
+    for name in loaded_names():
+        stop_model(name)
+
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if not loaded_names() and vram_is_idle(idle_mb):
+            return
+        time.sleep(0.5)
+
+    raise RuntimeError(
+        f"could not return the GPU to idle (loaded: {loaded_names() or 'none'}, "
+        f"VRAM {gpu_mem_used_mb()} MB vs idle {idle_mb} MB). "
+        "Restart the server with OLLAMA_MAX_LOADED_MODELS=1 and re-run.")
 
 
 def run_once(model, prompt, sampler):
@@ -333,27 +387,25 @@ def residency(model):
     return None
 
 
-def measure_model(model, label, kv_type, warm_runs=WARM_RUNS, verbose=True):
+def measure_model(model, label, kv_type, idle_mb, warm_runs=WARM_RUNS,
+                  verbose=True):
     if verbose:
         print(f"\n=== {label} :: {model} (KV {kv_type}) ===", file=sys.stderr)
 
-    small = build_prompt(SMALL_TOKENS)
-    large = build_prompt(LARGE_TOKENS)
-
-    unload(model)
-    baseline = [v for v in (gpu_mem_used_mb() for _ in range(5)) if v is not None]
-    baseline_mb = statistics.median(baseline) if baseline else None
+    ensure_idle(idle_mb)
 
     sampler = VramSampler()
     sampler.start()
 
-    cold = run_once(model, large, sampler)
+    cold = run_once(model, build_prompt(LARGE_TOKENS, new_nonce()), sampler)
     if verbose:
         print(f"  cold  large: {metrics(cold)['prefill_tps']:.1f} tok/s prefill, "
               f"load {metrics(cold)['load_s']:.1f}s", file=sys.stderr)
 
-    warm_large = [run_once(model, large, sampler) for _ in range(warm_runs)]
-    warm_small = [run_once(model, small, sampler) for _ in range(warm_runs)]
+    warm_large = [run_once(model, build_prompt(LARGE_TOKENS, new_nonce()), sampler)
+                  for _ in range(warm_runs)]
+    warm_small = [run_once(model, build_prompt(SMALL_TOKENS, new_nonce()), sampler)
+                  for _ in range(warm_runs)]
 
     sampler.stop()
 
@@ -364,6 +416,9 @@ def measure_model(model, label, kv_type, warm_runs=WARM_RUNS, verbose=True):
 
     def med(rows, key):
         return statistics.median([r[key] for r in rows]) if rows else 0.0
+
+    large_tokens = [r["prompt_tokens"] for r in large_m]
+    cache_hit = bool(large_tokens) and min(large_tokens) < 0.9 * max(large_tokens)
 
     result = {
         "label": label,
@@ -377,11 +432,12 @@ def measure_model(model, label, kv_type, warm_runs=WARM_RUNS, verbose=True):
         "load_s": round(cold_m["load_s"], 1),
         "cold_prefill_tps": round(cold_m["prefill_tps"], 1),
         "peak_vram_mb": round(sampler.peak, 0) if sampler.peak else None,
-        "baseline_vram_mb": baseline_mb,
-        "vram_delta_mb": (round(sampler.peak - baseline_mb, 0)
-                          if sampler.peak and baseline_mb is not None else None),
+        "baseline_vram_mb": idle_mb,
+        "vram_delta_mb": (round(sampler.peak - idle_mb, 0)
+                          if sampler.peak and idle_mb is not None else None),
         "residency": res,
         "runs": warm_runs,
+        "cache_hits": cache_hit,
     }
     result["verdict"], result["reasons"] = verdict(result)
     if verbose:
@@ -393,10 +449,12 @@ def measure_model(model, label, kv_type, warm_runs=WARM_RUNS, verbose=True):
 
 def verdict(r):
     reasons = []
+    if r.get("cache_hits"):
+        reasons.append("prompt-prefix cache hit during warm runs — prefill number is invalid")
     res = r.get("residency") or {}
     if not res:
         reasons.append("model not listed in /api/ps after a run")
-    elif res.get("resident", 0) < RESIDENT_FRACTION:
+    elif res.get("resident", res.get("percent_gpu", 0) / 100) < RESIDENT_FRACTION:
         reasons.append(f"spilled to CPU ({res.get('percent_gpu')}% GPU)")
     if r["decode_tps"] < MIN_DECODE_TPS:
         reasons.append(f"decode {r['decode_tps']} tok/s < {MIN_DECODE_TPS}")
@@ -411,11 +469,12 @@ def fallback_commands(model, kv_type):
     if kv_type != "f16":
         return []
     return [
-        "# 4B spilled at f16 KV. Restart the server with a quantised KV cache,",
-        "# then re-run this model:",
+        "# spilled at f16 KV. Restart the server with a quantised KV cache",
+        "# (KV quantisation needs Flash Attention), then re-run this model:",
+        "export OLLAMA_FLASH_ATTENTION=1",
         "export OLLAMA_KV_CACHE_TYPE=q8_0",
-        "ollama serve    # restart the server with the variable set",
-        f"python3 scripts/measure_stack.py --models {model}",
+        "ollama serve    # restart the server with these exported",
+        f"python3 scripts/measure_stack.py --models {model} --kv q8_0",
     ]
 
 
@@ -427,13 +486,35 @@ def markdown_row(r):
     delta = f"{r['vram_delta_mb'] / 1024:.2f}" if r.get("vram_delta_mb") is not None else "n/a"
     pct = f"{res.get('percent_gpu')}%" if res else "n/a"
     model = r["model"].split("/")[-1]
-    return (f"| {r['label']} | {model} | {r['kv']} | {r['decode_tps']} | "
-            f"{r['prefill_tps_large']} | {peak} | {delta} | {r['load_s']} | "
-            f"{pct} | {r['verdict']} |")
+    return (f"| {r['label']} | {model} | {r['kv']} | {r['prompt_tokens_large']} | "
+            f"{r['decode_tps']} | {r['prefill_tps_large']} | {peak} | {delta} | "
+            f"{r['load_s']} | {pct} | {r['verdict']} |")
 
 
-HEADER = ("| Machine | Model | KV | Decode tok/s | Prefill tok/s @2048 | "
-          "Peak VRAM (GB) | VRAM delta (GB) | Load (s) | Resident | Verdict |")
+HEADER = ("| Machine | Model | KV | Prompt tokens | Decode tok/s | "
+          "Prefill tok/s | Peak VRAM (GB) | VRAM delta (GB) | Load (s) | "
+          "Resident | Verdict |")
+
+
+def idle_vram():
+    samples = [v for v in (gpu_mem_used_mb() for _ in range(5)) if v is not None]
+    return statistics.median(samples) if samples else None
+
+
+def loaded_names():
+    return [m.get("name") or m.get("model") for m in loaded_models()]
+
+
+def env_preflight():
+    missing = [k for k in ("OLLAMA_NUM_PARALLEL", "OLLAMA_MAX_LOADED_MODELS",
+                           "OLLAMA_CONTEXT_LENGTH") if not os.environ.get(k)]
+    if not missing:
+        return []
+    return [
+        "these are not set in this shell: " + ", ".join(missing),
+        "the server reads them at startup — start `ollama serve` from the "
+        "shell that exported them, or they are not in effect",
+    ]
 
 
 def main(argv=None):
@@ -479,9 +560,17 @@ def main(argv=None):
         if key != "digests":
             print(f"  {key}: {value}", file=sys.stderr)
 
+    for warning in env_preflight():
+        print(f"warning: {warning}", file=sys.stderr)
+
+    ensure_idle(None)
+    idle_mb = idle_vram()
+    print(f"  idle VRAM: {idle_mb} MB", file=sys.stderr)
+
     results = []
     for model in args.models:
-        results.append(measure_model(model, args.label, args.kv, args.warm_runs))
+        results.append(measure_model(model, args.label, args.kv, idle_mb,
+                                     args.warm_runs))
 
     payload = {"machine": info, "results": results}
     print("\n" + HEADER)

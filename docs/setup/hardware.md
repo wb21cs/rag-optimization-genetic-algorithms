@@ -123,20 +123,26 @@ three branches.
 
 ### What the protocol does, and why
 
-* Two fixed prompts, sized to ~512 and ~2048 tokens. The text is identical
-  bytes on every machine, so the tokenizer produces identical
-  `prompt_eval_count` values — that is what makes tok/s comparable. 2048 is
-  the RAG-relevant size; 512 is there to show prefill scaling.
+* Two fixed prompts, sized to ~512 and ~2450 tokens on the Qwen3 tokenizer.
+  The text is identical on every machine, so the same prompt costs the same
+  tokens everywhere — that is what makes tok/s comparable.
+* Every run gets a **fresh nonce at the front of the prompt**. Ollama caches
+  prompt prefixes, so replaying identical bytes turns warm runs into cache
+  hits and reports 40,000+ tok/s prefill. The nonce invalidates the cache and
+  forces the full prompt to be re-evaluated. A row that still shows a cache
+  hit is marked invalid rather than reported.
 * Prefill and decode rates come from Ollama's own counters
   (`prompt_eval_count`/`prompt_eval_duration`,
   `eval_count`/`eval_duration`), not from a wall clock.
-* Per model: unload, one cold run at 2048 (so `load_duration` is real), three
-  warm runs at 2048, three warm runs at 512. Medians of the warm runs are the
-  reported numbers.
+* Before each model the script **unloads everything and proves the card is
+  idle**: `/api/ps` empty and VRAM back within 256 MB of the idle baseline
+  measured before any model was loaded. If it cannot get there it aborts —
+  a leftover model silently poisons the next model's peak and residency.
+* Per model: one cold run at the large prompt (so `load_duration` is real),
+  three warm runs at the large prompt, three warm runs at the small one.
+  Medians of the warm runs are the reported numbers.
 * VRAM is sampled from `nvidia-smi` every 100 ms while runs are in flight.
-  Three numbers are reported: idle baseline, absolute peak, and the delta. The
-  baseline is the evidence for the research doc's "~3.6 GB usable" assumption,
-  and it is what explains "fits on Linux, spills on Windows".
+  Three numbers are reported: idle baseline, absolute peak, and the delta.
 * Residency comes from `/api/ps`: `size_vram / size`. Anything below 99% is a
   spill.
 
@@ -157,27 +163,55 @@ the pipeline but its numbers should not go in the report as representative.
 
 Only if a row comes back `smoke-only` because of a spill:
 
-1. **Quantise the KV cache.** Restart the server with
-   `OLLAMA_KV_CACHE_TYPE=q8_0` and re-run that model with `--kv q8_0`.
-   Halves KV (~290 MB saved at 4096 ctx on the 4B) and keeps the 4B model —
-   the model the report is about.
-2. **Drop to 1.7B on that machine only.** Record it as such. Do not silently
+1. **Quantise the KV cache to q8_0.** Restart the server with
+   `OLLAMA_FLASH_ATTENTION=1` (KV quantisation needs it) and
+   `OLLAMA_KV_CACHE_TYPE=q8_0`, then re-run that model with `--kv q8_0`.
+   Keeps the 4B model — the model the report is about.
+2. **If q8_0 still spills, try q4_0.** On Laptop A this is the rung that
+   actually works (see results). It quarters the KV cache instead of halving
+   it, so record the quality caveat next to the row: q4_0 KV degrades
+   attention precision, and a number produced with it should not be compared
+   against an f16 run without saying so.
+3. **Drop to 1.7B on that machine only.** Record it as such. Do not silently
    swap the fleet's model.
-3. If neither fits, the machine is a smoke-test box and the weakest
+4. If neither fits, the machine is a smoke-test box and the weakest
    *working* laptop sets the ceiling — which is a finding the report needs.
 
 ## Results
 
-Filled row by row. Numbers are medians of three warm runs; `Peak` is absolute
-`nvidia-smi` memory, `Δ` is peak minus that machine's idle baseline.
+Filled row by row. Numbers are medians of three warm runs at the large
+prompt; `Peak` is absolute `nvidia-smi` memory, `Δ` is peak minus that
+machine's idle baseline.
 
-| Machine | Model | KV | Decode tok/s | Prefill tok/s @2048 | Peak VRAM (GB) | VRAM delta (GB) | Load (s) | Resident | Verdict |
-|---|---|---|---|---|---|---|---|---|---|
-| Laptop A — Linux, RTX 3050 Ti 4 GB | qwen3:4b-instruct-2507-q4_K_M | f16 | pending | pending | pending | pending | pending | pending | pending |
-| Laptop A — Linux, RTX 3050 Ti 4 GB | qwen3:1.7b | f16 | pending | pending | pending | pending | pending | pending | pending |
-| Laptop B — Windows, GTX 1060 6 GB | qwen3:4b-instruct-2507-q4_K_M | f16 | pending | pending | pending | pending | pending | pending | pending |
-| Laptop B — Windows, GTX 1060 6 GB | qwen3:1.7b | f16 | pending | pending | pending | pending | pending | pending | pending |
-| Laptop C — Mac | — | — | not measured | — | — | — | — | — | — |
+| Machine | Model | KV | Prompt tokens | Decode tok/s | Prefill tok/s | Peak VRAM (GB) | Δ VRAM (GB) | Load (s) | Resident | Verdict |
+|---|---|---|---|---|---|---|---|---|---|---|
+| Laptop A — Linux, RTX 3050 Ti 4 GB | qwen3:4b-instruct-2507-q4_K_M | f16 | 2449 | 30.0 | 1641 | 2.76 | 2.75 | 3.2 | 87% | smoke-only |
+| Laptop A — Linux, RTX 3050 Ti 4 GB | qwen3:4b-instruct-2507-q4_K_M | q8_0 | 2447 | 38.3 | 1789 | 2.74 | 2.72 | 3.7 | 94% | smoke-only |
+| Laptop A — Linux, RTX 3050 Ti 4 GB | qwen3:4b-instruct-2507-q4_K_M | q4_0 | 2448 | 50.6 | 1983 | 2.70 | 2.68 | 3.4 | 100% | works |
+| Laptop A — Linux, RTX 3050 Ti 4 GB | qwen3:1.7b | f16 | 2450 | 99.8 | 4750 | 1.74 | 1.72 | 2.1 | 100% | works |
+| Laptop B — Windows, GTX 1060 6 GB | qwen3:4b-instruct-2507-q4_K_M | f16 | pending | pending | pending | pending | pending | pending | pending | pending |
+| Laptop B — Windows, GTX 1060 6 GB | qwen3:1.7b | f16 | pending | pending | pending | pending | pending | pending | pending | pending |
+| Laptop C — Mac | — | — | not measured | — | — | — | — | — | — | — |
+
+### Reading Laptop A
+
+Idle VRAM is 15 MB, so the card really has ~4.08 GB free — the research
+doc's "~3.6 GB usable" guess is a Windows number, not a Linux one. The 4B
+still does not fit at f16 KV (87% resident), which is why decode lands at
+30 tok/s instead of the ~50 tok/s the fully-resident q4_0 row reaches.
+
+* **f16 → q8_0 → q4_0** buys 7, 13, 20 percentage points of residency and
+  monotonically more throughput. q8_0, the planned fallback, is *not enough*
+  on this card; q4_0 is.
+* The 4B at q4_0 KV is the only 4B configuration that clears the bar here,
+  and it carries a KV-quality caveat that belongs next to any number taken
+  from it.
+* **1.7B is clean** in every configuration, at roughly 100 tok/s decode.
+  That is the iteration model, and this laptop is fine for it.
+* The GPU is capped at ~30 W (1.4 GHz, 47 °C, 98% util during decode), not
+  thermally throttled. That cap, not the driver, is what sets these numbers.
+
+Every model loaded in 2–4 s, so cold start is a non-issue on this machine.
 
 ### Environment actually recorded
 
@@ -196,7 +230,10 @@ A row is only reproducible if that block is in the issue comment with it.
   Ollama's docs. The fleet's third machine has not been checked, so no
   ceiling claim can be made for it yet.
 * **Windows VRAM overhead.** The idle baseline on Windows is expected to be a
-  few hundred MB, not the 15 MiB Linux idles at. The delta column is what to
+  few hundred MB, not the 15 MB Linux idles at. The delta column is what to
   compare across machines; the absolute peak is what to compare against 4 GB.
+* **q4_0 KV quality.** It is the rung that fits on Laptop A, but it changes
+  attention precision. No accuracy measurement exists yet, so treat a q4_0
+  row as a throughput/feasibility result, not a quality-comparable one.
 * **Digest pinning by reference.** Pulling `@sha256:` is untested in the user
   docs; hence tag-pull + recorded digest rather than a digest pull.
